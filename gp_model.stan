@@ -48,7 +48,6 @@ transformed parameters {
 }
 
 model {
-  // priors (先用宽松但稳定的)
   z     ~ std_normal();
   a     ~ normal(0, 5);
   rho   ~ inv_gamma(5, 5);
@@ -61,10 +60,13 @@ model {
 
 generated quantities {
   vector[N] log_lik;
-  array[N] real y_rep;
+  vector[N] y_rep;   // 统一命名为 y_rep
+  vector[N] y_hat;   // 统一命名为 y_hat (中位数/均值预测)
 
   for (n in 1:N) {
-    log_lik[n] = normal_lpdf(logy[n] | a + f[n], sigma);
-    y_rep[n] = lognormal_rng(a + f[n], sigma);
+    real mu_log = a + f[n];
+    log_lik[n] = normal_lpdf(logy[n] | mu_log, sigma);
+    y_hat[n] = exp(mu_log); // 还原到浓度尺度
+    y_rep[n] = lognormal_rng(mu_log, sigma);
   }
 }

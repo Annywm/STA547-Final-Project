@@ -1,65 +1,88 @@
+// Two-compartment + first-order absorption
+// NONMEM event table + lognormal observation model
+
 data {
-  int<lower=1> N;
-  array[N] real t_obs;
-  array[N] real y_obs;
-  real dose;
+  int<lower=1> nt;                 // total event rows (dose + obs)
+  int<lower=1> nObs;               // number of observation rows
+  array[nObs] int<lower=1> iObs;   // row indices of observations in 1:nt
+
+  // NONMEM-style event table columns
+  array[nt] int<lower=1> cmt;      // compartment index (1=gut, 2=central, 3=peri)
+  array[nt] int evid;             // 1=dose/event, 0=observation
+  array[nt] int addl;             // additional doses
+  array[nt] int ss;               // steady-state flag
+  array[nt] real amt;             // amount dosed (mg)
+  array[nt] real time;            // time (h)
+  array[nt] real rate;            // infusion rate (0 for bolus)
+  array[nt] real ii;              // inter-dose interval (h)
+
+  vector<lower=0>[nObs] cObs;      // observed concentration
+}
+
+transformed data {
+  vector[nObs] logCObs = log(cObs);
+  int nTheta = 5;
+  int nCmt = 3;
 }
 
 parameters {
-  real<lower=0> ka;
+  // individual parameters (single subject)
   real<lower=0> CL;
-  real<lower=0> V_cent;
-  real<lower=0> sigma;
   real<lower=0> Q;
-  real<lower=0> V_peri;
+  real<lower=0> V1;     // central volume
+  real<lower=0> V2;     // peripheral volume
+  real<lower=0> ka;
+
+  // lognormal residual SD (on log scale)
+  real<lower=0> sigma;
 }
 
 transformed parameters {
-  vector[N] c;
-  matrix[3, 3] K;   //  (1=Gut, 2=Cent, 3=Peri)
-  vector[3] y0;     // initial state
-  
-  K = rep_matrix(0, 3, 3);
-  
-  K[1, 1] = -ka;
-  
-  K[2, 1] = ka;
-  K[2, 2] = -(CL/V_cent + Q/V_cent);
-  K[2, 3] = Q/V_peri;
-  
-  K[3, 2] = Q/V_cent;
-  K[3, 3] = -Q/V_peri;
+  array[nTheta] real theta;
+  matrix[nCmt, nt] x;          // amounts in compartments over event rows
+  row_vector[nt] cHat;         // predicted central concentration over event rows
+  vector[nObs] cHatObs;        // predicted concentration at observation rows
 
-  // initial state
-  y0[1] = dose;
-  y0[2] = 0;
-  y0[3] = 0;
+  theta[1] = CL;
+  theta[2] = Q;
+  theta[3] = V1;
+  theta[4] = V2;
+  theta[5] = ka;
 
-  // calculate concentration at each time point
-  for (i in 1:N) {
-    // calculate matrix exponential e^(Kt)
-    vector[3] y_t = matrix_exp(K * t_obs[i]) * y0;
-    
-    // we can only observe the central compartment (second compartment)
-    c[i] = y_t[2] / V_cent;
-  }
+  // Torsten analytic solver for 2-cpt with first-order absorption
+  x = pmx_solve_twocpt(time, amt, rate, ii, evid, cmt, addl, ss, theta);
+
+  // central concentration = amount in central / V1
+  cHat = fmax(x[2, :], 0) ./ V1;
+
+  // pick out observation rows
+  cHatObs = to_vector(cHat[iObs]);
 }
 
 model {
+  // Priors (match your simulation settings)
   CL ~ lognormal(log(10), 0.25);
-  V_cent ~ lognormal(log(35), 0.25);
+  Q  ~ lognormal(log(15), 0.5);
+  V1 ~ lognormal(log(35), 0.25);
+  V2 ~ lognormal(log(105), 0.5);
   ka ~ lognormal(log(2.5), 1);
-  sigma ~ normal(0, 1);
-  y_obs ~ lognormal(log(c), sigma);
-  Q ~ lognormal(log(15), 0.5);
-  V_peri ~ lognormal(log(105), 0.5);
+
+  // You used abs(N(0,1)) in simulation; common fitting prior:
+  sigma ~ cauchy(0, 1);
+
+  // Likelihood: lognormal noise (same as cObs = cTrue * exp(N(0,sigma)))
+  logCObs ~ normal(log(fmax(cHatObs, 1e-12)), sigma);
 }
 
 generated quantities {
-  array[N] real y_rep;
-  vector[N] log_lik;
-  for (i in 1:N) {
-    y_rep[i] = lognormal_rng(log(c[i]), sigma);
-    log_lik[i] = lognormal_lpdf(y_obs[i] | log(c[i]), sigma);
+  vector[nObs] log_lik;
+  vector[nObs] y_rep; // 统一命名为 y_rep，用于 PPC
+
+  for (i in 1:nObs) {
+    // 提前计算好 log_chat，避免 normal_lpdf 和 normal_rng 重复计算
+    real log_chat = log(fmax(cHatObs[i], 1e-12)); 
+    log_lik[i] = normal_lpdf(logCObs[i] | log_chat, sigma);
+    y_rep[i] = exp(normal_rng(log_chat, sigma));
   }
 }
+
